@@ -17,6 +17,8 @@ AimdkConfig config_from_dict(py::dict cfg_dict) {
   }
   if (cfg_dict.contains("state_timeout")) cfg.state_timeout = cfg_dict["state_timeout"].cast<double>();
   if (cfg_dict.contains("base_imu_topic")) cfg.base_imu_topic = cfg_dict["base_imu_topic"].cast<std::string>();
+  if (cfg_dict.contains("enable_odometry")) cfg.enable_odometry = cfg_dict["enable_odometry"].cast<bool>();
+  if (cfg_dict.contains("odometry_topic")) cfg.odometry_topic = cfg_dict["odometry_topic"].cast<std::string>();
 
   if (cfg_dict.contains("leg_state_topic")) cfg.leg_state_topic = cfg_dict["leg_state_topic"].cast<std::string>();
   if (cfg_dict.contains("waist_state_topic")) cfg.waist_state_topic = cfg_dict["waist_state_topic"].cast<std::string>();
@@ -55,6 +57,8 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("shutdown_publish_duration", &AimdkConfig::shutdown_publish_duration)
       .def_readwrite("state_timeout", &AimdkConfig::state_timeout)
       .def_readwrite("base_imu_topic", &AimdkConfig::base_imu_topic)
+      .def_readwrite("enable_odometry", &AimdkConfig::enable_odometry)
+      .def_readwrite("odometry_topic", &AimdkConfig::odometry_topic)
       .def_readwrite("joint_names", &AimdkConfig::joint_names)
       .def_readwrite("leg_joint_names", &AimdkConfig::leg_joint_names)
       .def_readwrite("waist_joint_names", &AimdkConfig::waist_joint_names)
@@ -75,11 +79,19 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("gyroscope", &ImuState::gyroscope)
       .def_readwrite("accelerometer", &ImuState::accelerometer);
 
+  py::class_<OdometryState>(m, "OdometryState", py::module_local())
+      .def(py::init<>())
+      .def_readwrite("valid", &OdometryState::valid)
+      .def_readwrite("position", &OdometryState::position)
+      .def_readwrite("quaternion", &OdometryState::quaternion)
+      .def_readwrite("linear_velocity", &OdometryState::linear_velocity);
+
   py::class_<RobotState>(m, "RobotState", py::module_local())
       .def(py::init<size_t>(), py::arg("num_motors") = 0)
       .def_readwrite("tick", &RobotState::tick)
       .def_readwrite("motor_state", &RobotState::motor_state)
-      .def_readwrite("imu_state", &RobotState::imu_state);
+      .def_readwrite("imu_state", &RobotState::imu_state)
+      .def_readwrite("odometry_state", &RobotState::odometry_state);
 
   py::class_<AimdkController>(m, "AimdkController")
       .def(py::init([](py::dict cfg_dict) { return new AimdkController(config_from_dict(cfg_dict)); }))

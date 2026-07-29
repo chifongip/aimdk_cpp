@@ -64,6 +64,9 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
     throw std::invalid_argument("AimDK timing values must be positive and damping values must be non-negative");
   }
   validate_gains(cfg_.stiffness, cfg_.damping, cfg_.joint_names.size());
+  if (cfg_.enable_odometry && cfg_.odometry_topic.empty()) {
+    throw std::invalid_argument("odometry_topic must not be empty when odometry is enabled");
+  }
 
   std::set<std::string> unique_joint_names(cfg_.joint_names.begin(), cfg_.joint_names.end());
   if (unique_joint_names.size() != cfg_.joint_names.size()) {
@@ -113,6 +116,15 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
         [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg); });
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
         cfg_.base_imu_topic, qos, [this](const sensor_msgs::msg::Imu::SharedPtr msg) { imu_callback(msg); });
+    if (cfg_.enable_odometry) {
+      // The X2 odometry publisher is a live sensor stream and uses volatile
+      // durability. Requesting transient-local here would make DDS reject the
+      // endpoint match, leaving odometry_received_ false indefinitely.
+      auto odometry_qos = rclcpp::SensorDataQoS();
+      odometry_sub_ = node_->create_subscription<nav_msgs::msg::Odometry>(
+          cfg_.odometry_topic, odometry_qos,
+          [this](const nav_msgs::msg::Odometry::SharedPtr msg) { odometry_callback(msg); });
+    }
 
     leg_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.leg_command_topic, qos);
     waist_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.waist_command_topic, qos);
@@ -186,6 +198,9 @@ bool AimdkController::state_is_fresh(double timeout_sec) {
   }
   const auto cutoff = std::chrono::steady_clock::now() - std::chrono::duration<double>(timeout_sec);
   if (imu_update_time_ < cutoff) {
+    return false;
+  }
+  if (cfg_.enable_odometry && (!odometry_received_ || odometry_update_time_ < cutoff)) {
     return false;
   }
   for (const auto& name : cfg_.joint_names) {
@@ -333,6 +348,47 @@ void AimdkController::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
       static_cast<float>(msg->linear_acceleration.x),
       static_cast<float>(msg->linear_acceleration.y),
       static_cast<float>(msg->linear_acceleration.z),
+  };
+}
+
+void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  const auto& position = msg->pose.pose.position;
+  const auto& orientation = msg->pose.pose.orientation;
+  const auto& linear = msg->twist.twist.linear;
+  const double quaternion_norm =
+      std::sqrt(orientation.x * orientation.x + orientation.y * orientation.y +
+                orientation.z * orientation.z + orientation.w * orientation.w);
+  const bool finite =
+      std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
+      std::isfinite(orientation.x) && std::isfinite(orientation.y) &&
+      std::isfinite(orientation.z) && std::isfinite(orientation.w) &&
+      std::isfinite(linear.x) && std::isfinite(linear.y) && std::isfinite(linear.z);
+  if (!finite || !std::isfinite(quaternion_norm) || quaternion_norm < 1e-6) {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 2000,
+        "Ignoring invalid AimDK odometry sample from %s", cfg_.odometry_topic.c_str());
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  odometry_received_ = true;
+  odometry_update_time_ = std::chrono::steady_clock::now();
+  state_.odometry_state.valid = true;
+  state_.odometry_state.position = {
+      static_cast<float>(position.x),
+      static_cast<float>(position.y),
+      static_cast<float>(position.z),
+  };
+  state_.odometry_state.quaternion = {
+      static_cast<float>(orientation.x / quaternion_norm),
+      static_cast<float>(orientation.y / quaternion_norm),
+      static_cast<float>(orientation.z / quaternion_norm),
+      static_cast<float>(orientation.w / quaternion_norm),
+  };
+  state_.odometry_state.linear_velocity = {
+      static_cast<float>(linear.x),
+      static_cast<float>(linear.y),
+      static_cast<float>(linear.z),
   };
 }
 

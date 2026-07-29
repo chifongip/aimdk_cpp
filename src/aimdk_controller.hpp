@@ -2,6 +2,7 @@
 
 #include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <aimdk_msgs/msg/joint_state_array.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 
@@ -24,6 +25,8 @@ struct AimdkConfig {
   double shutdown_publish_duration{0.2};
   double state_timeout{0.1};
   std::string base_imu_topic{"/aima/hal/imu/torso/state"};
+  bool enable_odometry{false};
+  std::string odometry_topic{"/aima/mc/leg_odometry"};
 
   std::string leg_state_topic{"/aima/hal/joint/leg/state"};
   std::string waist_state_topic{"/aima/hal/joint/waist/state"};
@@ -60,10 +63,18 @@ struct ImuState {
   std::vector<float> accelerometer{0.0F, 0.0F, 0.0F};
 };
 
+struct OdometryState {
+  bool valid{false};
+  std::vector<float> position{0.0F, 0.0F, 0.0F};
+  std::vector<float> quaternion{0.0F, 0.0F, 0.0F, 1.0F};
+  std::vector<float> linear_velocity{0.0F, 0.0F, 0.0F};
+};
+
 struct RobotState {
   uint64_t tick{0};
   MotorState motor_state;
   ImuState imu_state;
+  OdometryState odometry_state;
 
   explicit RobotState(size_t num_motors = 0) : motor_state(num_motors) {}
 };
@@ -102,6 +113,7 @@ class AimdkController {
   rclcpp::Subscription<aimdk_msgs::msg::JointStateArray>::SharedPtr arm_sub_;
   rclcpp::Subscription<aimdk_msgs::msg::JointStateArray>::SharedPtr head_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_sub_;
 
   rclcpp::Publisher<aimdk_msgs::msg::JointCommandArray>::SharedPtr leg_pub_;
   rclcpp::Publisher<aimdk_msgs::msg::JointCommandArray>::SharedPtr waist_pub_;
@@ -116,6 +128,8 @@ class AimdkController {
   std::map<std::string, std::chrono::steady_clock::time_point> joint_update_times_;
   bool imu_received_{false};
   std::chrono::steady_clock::time_point imu_update_time_{};
+  bool odometry_received_{false};
+  std::chrono::steady_clock::time_point odometry_update_time_{};
   RobotState state_;
   std::vector<double> stiffness_;
   std::vector<double> damping_;
@@ -128,6 +142,7 @@ class AimdkController {
 
   void joint_callback(const aimdk_msgs::msg::JointStateArray::SharedPtr msg);
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
+  void odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
   void publish_loop();
   void publish_passive_commands();
   void publish_damping_commands();

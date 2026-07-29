@@ -11,6 +11,7 @@ find_package(pybind11 CONFIG REQUIRED)
 
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(aimdk_msgs REQUIRED)
 
 python_add_library(aimdk_cpp MODULE
@@ -24,6 +25,7 @@ target_link_libraries(aimdk_cpp
     pybind11::headers
     rclcpp::rclcpp
     sensor_msgs::sensor_msgs__rosidl_typesupport_cpp
+    nav_msgs::nav_msgs__rosidl_typesupport_cpp
     aimdk_msgs::aimdk_msgs__rosidl_typesupport_cpp)
 
 target_include_directories(aimdk_cpp PRIVATE src)
