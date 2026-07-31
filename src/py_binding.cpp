@@ -16,9 +16,18 @@ AimdkConfig config_from_dict(py::dict cfg_dict) {
     cfg.shutdown_publish_duration = cfg_dict["shutdown_publish_duration"].cast<double>();
   }
   if (cfg_dict.contains("state_timeout")) cfg.state_timeout = cfg_dict["state_timeout"].cast<double>();
+  if (cfg_dict.contains("odometry_timeout")) {
+    cfg.odometry_timeout = cfg_dict["odometry_timeout"].cast<double>();
+  }
   if (cfg_dict.contains("base_imu_topic")) cfg.base_imu_topic = cfg_dict["base_imu_topic"].cast<std::string>();
   if (cfg_dict.contains("enable_odometry")) cfg.enable_odometry = cfg_dict["enable_odometry"].cast<bool>();
   if (cfg_dict.contains("odometry_topic")) cfg.odometry_topic = cfg_dict["odometry_topic"].cast<std::string>();
+  if (cfg_dict.contains("odometry_parent_frame")) {
+    cfg.odometry_parent_frame = cfg_dict["odometry_parent_frame"].cast<std::string>();
+  }
+  if (cfg_dict.contains("odometry_child_frame")) {
+    cfg.odometry_child_frame = cfg_dict["odometry_child_frame"].cast<std::string>();
+  }
 
   if (cfg_dict.contains("leg_state_topic")) cfg.leg_state_topic = cfg_dict["leg_state_topic"].cast<std::string>();
   if (cfg_dict.contains("waist_state_topic")) cfg.waist_state_topic = cfg_dict["waist_state_topic"].cast<std::string>();
@@ -56,9 +65,12 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("shutdown_damping", &AimdkConfig::shutdown_damping)
       .def_readwrite("shutdown_publish_duration", &AimdkConfig::shutdown_publish_duration)
       .def_readwrite("state_timeout", &AimdkConfig::state_timeout)
+      .def_readwrite("odometry_timeout", &AimdkConfig::odometry_timeout)
       .def_readwrite("base_imu_topic", &AimdkConfig::base_imu_topic)
       .def_readwrite("enable_odometry", &AimdkConfig::enable_odometry)
       .def_readwrite("odometry_topic", &AimdkConfig::odometry_topic)
+      .def_readwrite("odometry_parent_frame", &AimdkConfig::odometry_parent_frame)
+      .def_readwrite("odometry_child_frame", &AimdkConfig::odometry_child_frame)
       .def_readwrite("joint_names", &AimdkConfig::joint_names)
       .def_readwrite("leg_joint_names", &AimdkConfig::leg_joint_names)
       .def_readwrite("waist_joint_names", &AimdkConfig::waist_joint_names)
@@ -82,9 +94,17 @@ PYBIND11_MODULE(aimdk_cpp, m) {
   py::class_<OdometryState>(m, "OdometryState", py::module_local())
       .def(py::init<>())
       .def_readwrite("valid", &OdometryState::valid)
+      .def_readwrite("degenerate", &OdometryState::degenerate)
+      .def_readwrite("sequence", &OdometryState::sequence)
+      .def_readwrite("stamp_sec", &OdometryState::stamp_sec)
+      .def_readwrite("stamp_nanosec", &OdometryState::stamp_nanosec)
+      .def_readwrite("frame_id", &OdometryState::frame_id)
+      .def_readwrite("child_frame_id", &OdometryState::child_frame_id)
       .def_readwrite("position", &OdometryState::position)
       .def_readwrite("quaternion", &OdometryState::quaternion)
-      .def_readwrite("linear_velocity", &OdometryState::linear_velocity);
+      .def_readwrite("linear_velocity", &OdometryState::linear_velocity)
+      .def_readwrite("angular_velocity", &OdometryState::angular_velocity)
+      .def_readwrite("pose_covariance", &OdometryState::pose_covariance);
 
   py::class_<RobotState>(m, "RobotState", py::module_local())
       .def(py::init<size_t>(), py::arg("num_motors") = 0)
