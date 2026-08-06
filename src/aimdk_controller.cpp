@@ -58,9 +58,11 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
       latest_positions_(cfg.joint_names.size(), 0.0) {
   if (!std::isfinite(cfg_.control_dt) || !std::isfinite(cfg_.publish_dt) ||
       !std::isfinite(cfg_.command_timeout) || !std::isfinite(cfg_.state_timeout) ||
+      !std::isfinite(cfg_.odometry_timeout) ||
       !std::isfinite(cfg_.shutdown_publish_duration) || !std::isfinite(cfg_.shutdown_damping) ||
       cfg_.control_dt <= 0.0 || cfg_.publish_dt <= 0.0 || cfg_.command_timeout <= 0.0 ||
-      cfg_.state_timeout <= 0.0 || cfg_.shutdown_publish_duration < 0.0 || cfg_.shutdown_damping < 0.0) {
+      cfg_.state_timeout <= 0.0 || cfg_.odometry_timeout <= 0.0 ||
+      cfg_.shutdown_publish_duration < 0.0 || cfg_.shutdown_damping < 0.0) {
     throw std::invalid_argument("AimDK timing values must be positive and damping values must be non-negative");
   }
   validate_gains(cfg_.stiffness, cfg_.damping, cfg_.joint_names.size());
@@ -196,11 +198,14 @@ bool AimdkController::state_is_fresh(double timeout_sec) {
   if (!imu_received_ || received_joint_names_.size() != cfg_.joint_names.size()) {
     return false;
   }
-  const auto cutoff = std::chrono::steady_clock::now() - std::chrono::duration<double>(timeout_sec);
+  const auto now = std::chrono::steady_clock::now();
+  const auto cutoff = now - std::chrono::duration<double>(timeout_sec);
   if (imu_update_time_ < cutoff) {
     return false;
   }
-  if (cfg_.enable_odometry && (!odometry_received_ || odometry_update_time_ < cutoff)) {
+  const auto odometry_cutoff = now - std::chrono::duration<double>(cfg_.odometry_timeout);
+  if (cfg_.enable_odometry &&
+      (!odometry_received_ || !state_.odometry_state.valid || odometry_update_time_ < odometry_cutoff)) {
     return false;
   }
   for (const auto& name : cfg_.joint_names) {
@@ -355,6 +360,7 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
   const auto& position = msg->pose.pose.position;
   const auto& orientation = msg->pose.pose.orientation;
   const auto& linear = msg->twist.twist.linear;
+  const auto& angular = msg->twist.twist.angular;
   const double quaternion_norm =
       std::sqrt(orientation.x * orientation.x + orientation.y * orientation.y +
                 orientation.z * orientation.z + orientation.w * orientation.w);
@@ -362,18 +368,35 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
       std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
       std::isfinite(orientation.x) && std::isfinite(orientation.y) &&
       std::isfinite(orientation.z) && std::isfinite(orientation.w) &&
-      std::isfinite(linear.x) && std::isfinite(linear.y) && std::isfinite(linear.z);
+      std::isfinite(linear.x) && std::isfinite(linear.y) && std::isfinite(linear.z) &&
+      std::isfinite(angular.x) && std::isfinite(angular.y) && std::isfinite(angular.z);
   if (!finite || !std::isfinite(quaternion_norm) || quaternion_norm < 1e-6) {
     RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 2000,
         "Ignoring invalid AimDK odometry sample from %s", cfg_.odometry_topic.c_str());
     return;
   }
+  if ((!cfg_.odometry_parent_frame.empty() && msg->header.frame_id != cfg_.odometry_parent_frame) ||
+      (!cfg_.odometry_child_frame.empty() && msg->child_frame_id != cfg_.odometry_child_frame)) {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 2000,
+        "Ignoring odometry with frames %s -> %s; expected %s -> %s",
+        msg->header.frame_id.c_str(), msg->child_frame_id.c_str(),
+        cfg_.odometry_parent_frame.c_str(), cfg_.odometry_child_frame.c_str());
+    return;
+  }
+  const bool degenerate = msg->pose.covariance[0] >= 0.5;
 
   std::lock_guard<std::mutex> lock(state_mutex_);
   odometry_received_ = true;
   odometry_update_time_ = std::chrono::steady_clock::now();
-  state_.odometry_state.valid = true;
+  state_.odometry_state.valid = !degenerate;
+  state_.odometry_state.degenerate = degenerate;
+  ++state_.odometry_state.sequence;
+  state_.odometry_state.stamp_sec = msg->header.stamp.sec;
+  state_.odometry_state.stamp_nanosec = msg->header.stamp.nanosec;
+  state_.odometry_state.frame_id = msg->header.frame_id;
+  state_.odometry_state.child_frame_id = msg->child_frame_id;
   state_.odometry_state.position = {
       static_cast<float>(position.x),
       static_cast<float>(position.y),
@@ -390,6 +413,13 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
       static_cast<float>(linear.y),
       static_cast<float>(linear.z),
   };
+  state_.odometry_state.angular_velocity = {
+      static_cast<float>(angular.x),
+      static_cast<float>(angular.y),
+      static_cast<float>(angular.z),
+  };
+  state_.odometry_state.pose_covariance.assign(
+      msg->pose.covariance.begin(), msg->pose.covariance.end());
 }
 
 void AimdkController::publish_loop() {

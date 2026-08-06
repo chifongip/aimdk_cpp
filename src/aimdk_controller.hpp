@@ -24,9 +24,12 @@ struct AimdkConfig {
   double shutdown_damping{5.0};
   double shutdown_publish_duration{0.2};
   double state_timeout{0.1};
+  double odometry_timeout{0.1};
   std::string base_imu_topic{"/aima/hal/imu/torso/state"};
   bool enable_odometry{false};
   std::string odometry_topic{"/aima/mc/leg_odometry"};
+  std::string odometry_parent_frame{};
+  std::string odometry_child_frame{};
 
   std::string leg_state_topic{"/aima/hal/joint/leg/state"};
   std::string waist_state_topic{"/aima/hal/joint/waist/state"};
@@ -65,9 +68,17 @@ struct ImuState {
 
 struct OdometryState {
   bool valid{false};
+  bool degenerate{false};
+  uint64_t sequence{0};
+  int64_t stamp_sec{0};
+  uint32_t stamp_nanosec{0};
+  std::string frame_id;
+  std::string child_frame_id;
   std::vector<float> position{0.0F, 0.0F, 0.0F};
   std::vector<float> quaternion{0.0F, 0.0F, 0.0F, 1.0F};
   std::vector<float> linear_velocity{0.0F, 0.0F, 0.0F};
+  std::vector<float> angular_velocity{0.0F, 0.0F, 0.0F};
+  std::vector<double> pose_covariance = std::vector<double>(36, 0.0);
 };
 
 struct RobotState {
