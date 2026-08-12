@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -18,6 +19,7 @@
 
 struct AimdkConfig {
   bool act{true};
+  std::string node_name{"robojudo_aimdk_cpp"};
   double control_dt{0.02};
   double publish_dt{0.002};
   double command_timeout{0.1};
@@ -90,6 +92,23 @@ struct RobotState {
   explicit RobotState(size_t num_motors = 0) : motor_state(num_motors) {}
 };
 
+struct StateFreshnessReport {
+  bool required_streams_fresh{false};
+  bool imu_received{false};
+  std::optional<double> imu_age_sec;
+  std::vector<std::string> missing_joint_names;
+  std::vector<std::string> stale_joint_names;
+  std::map<std::string, double> joint_age_sec;
+  bool odometry_required{false};
+  bool odometry_received{false};
+  bool odometry_valid{false};
+  bool odometry_degenerate{false};
+  std::optional<double> odometry_age_sec;
+  std::string last_odometry_rejection_reason;
+  std::optional<double> last_odometry_rejection_age_sec;
+  std::vector<std::string> reasons;
+};
+
 enum class AimdkCommandMode { IDLE, POSITION, PASSIVE, DAMPING };
 
 class AimdkController {
@@ -99,6 +118,7 @@ class AimdkController {
 
   bool self_check(double timeout_sec = 2.0);
   bool state_is_fresh(double timeout_sec);
+  StateFreshnessReport get_state_freshness_report(double timeout_sec);
   RobotState get_robot_state();
   void step(const std::vector<double>& positions);
   void arm_position_control();
@@ -141,6 +161,8 @@ class AimdkController {
   std::chrono::steady_clock::time_point imu_update_time_{};
   bool odometry_received_{false};
   std::chrono::steady_clock::time_point odometry_update_time_{};
+  std::string last_odometry_rejection_reason_;
+  std::chrono::steady_clock::time_point last_odometry_rejection_time_{};
   RobotState state_;
   std::vector<double> stiffness_;
   std::vector<double> damping_;
