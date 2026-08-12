@@ -8,6 +8,7 @@ namespace py = pybind11;
 AimdkConfig config_from_dict(py::dict cfg_dict) {
   AimdkConfig cfg;
   if (cfg_dict.contains("act")) cfg.act = cfg_dict["act"].cast<bool>();
+  if (cfg_dict.contains("node_name")) cfg.node_name = cfg_dict["node_name"].cast<std::string>();
   if (cfg_dict.contains("control_dt")) cfg.control_dt = cfg_dict["control_dt"].cast<double>();
   if (cfg_dict.contains("publish_dt")) cfg.publish_dt = cfg_dict["publish_dt"].cast<double>();
   if (cfg_dict.contains("command_timeout")) cfg.command_timeout = cfg_dict["command_timeout"].cast<double>();
@@ -59,6 +60,7 @@ PYBIND11_MODULE(aimdk_cpp, m) {
   py::class_<AimdkConfig>(m, "AimdkConfig")
       .def(py::init<>())
       .def_readwrite("act", &AimdkConfig::act)
+      .def_readwrite("node_name", &AimdkConfig::node_name)
       .def_readwrite("control_dt", &AimdkConfig::control_dt)
       .def_readwrite("publish_dt", &AimdkConfig::publish_dt)
       .def_readwrite("command_timeout", &AimdkConfig::command_timeout)
@@ -113,11 +115,32 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("imu_state", &RobotState::imu_state)
       .def_readwrite("odometry_state", &RobotState::odometry_state);
 
+  py::class_<StateFreshnessReport>(m, "StateFreshnessReport", py::module_local())
+      .def(py::init<>())
+      .def_readwrite("required_streams_fresh", &StateFreshnessReport::required_streams_fresh)
+      .def_readwrite("imu_received", &StateFreshnessReport::imu_received)
+      .def_readwrite("imu_age_sec", &StateFreshnessReport::imu_age_sec)
+      .def_readwrite("missing_joint_names", &StateFreshnessReport::missing_joint_names)
+      .def_readwrite("stale_joint_names", &StateFreshnessReport::stale_joint_names)
+      .def_readwrite("joint_age_sec", &StateFreshnessReport::joint_age_sec)
+      .def_readwrite("odometry_required", &StateFreshnessReport::odometry_required)
+      .def_readwrite("odometry_received", &StateFreshnessReport::odometry_received)
+      .def_readwrite("odometry_valid", &StateFreshnessReport::odometry_valid)
+      .def_readwrite("odometry_degenerate", &StateFreshnessReport::odometry_degenerate)
+      .def_readwrite("odometry_age_sec", &StateFreshnessReport::odometry_age_sec)
+      .def_readwrite("last_odometry_rejection_reason", &StateFreshnessReport::last_odometry_rejection_reason)
+      .def_readwrite(
+          "last_odometry_rejection_age_sec", &StateFreshnessReport::last_odometry_rejection_age_sec)
+      .def_readwrite("reasons", &StateFreshnessReport::reasons);
+
   py::class_<AimdkController>(m, "AimdkController")
       .def(py::init([](py::dict cfg_dict) { return new AimdkController(config_from_dict(cfg_dict)); }))
       .def(py::init<const AimdkConfig&>())
       .def("self_check", &AimdkController::self_check, py::arg("timeout_sec") = 2.0)
       .def("state_is_fresh", &AimdkController::state_is_fresh, py::arg("timeout_sec"))
+      .def(
+          "get_state_freshness_report", &AimdkController::get_state_freshness_report,
+          py::arg("timeout_sec"))
       .def("get_robot_state", &AimdkController::get_robot_state)
       .def("step", &AimdkController::step, py::arg("positions"))
       .def("arm_position_control", &AimdkController::arm_position_control)

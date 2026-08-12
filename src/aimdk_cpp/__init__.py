@@ -1,4 +1,12 @@
-from .aimdk_cpp import AimdkConfig, AimdkController, ImuState, MotorState, OdometryState, RobotState
+from .aimdk_cpp import (
+    AimdkConfig,
+    AimdkController,
+    ImuState,
+    MotorState,
+    OdometryState,
+    RobotState,
+    StateFreshnessReport,
+)
 
 __all__ = [
     "AimdkConfig",
@@ -7,4 +15,5 @@ __all__ = [
     "MotorState",
     "OdometryState",
     "RobotState",
+    "StateFreshnessReport",
 ]

@@ -100,7 +100,7 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
   init_rclcpp_once();
   rclcpp_registered_ = true;
   try {
-    node_ = rclcpp::Node::make_shared("robojudo_aimdk_cpp");
+    node_ = rclcpp::Node::make_shared(cfg_.node_name);
     executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
     auto qos = rclcpp::SensorDataQoS();
 
@@ -128,21 +128,25 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
           [this](const nav_msgs::msg::Odometry::SharedPtr msg) { odometry_callback(msg); });
     }
 
-    leg_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.leg_command_topic, qos);
-    waist_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.waist_command_topic, qos);
-    arm_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.arm_command_topic, qos);
-    head_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.head_command_topic, qos);
+    if (cfg_.act) {
+      leg_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.leg_command_topic, qos);
+      waist_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.waist_command_topic, qos);
+      arm_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.arm_command_topic, qos);
+      head_pub_ = node_->create_publisher<aimdk_msgs::msg::JointCommandArray>(cfg_.head_command_topic, qos);
+    }
 
     executor_->add_node(node_);
     running_ = true;
-    publish_running_ = true;
     spin_thread_ = std::thread([this]() {
       while (running_ && rclcpp::ok()) {
         executor_->spin_some();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
     });
-    publish_thread_ = std::thread(&AimdkController::publish_loop, this);
+    if (cfg_.act) {
+      publish_running_ = true;
+      publish_thread_ = std::thread(&AimdkController::publish_loop, this);
+    }
   } catch (...) {
     publish_running_ = false;
     running_ = false;
@@ -190,31 +194,66 @@ bool AimdkController::state_is_fresh(double timeout_sec) {
   if (!cfg_.act) {
     return true;
   }
+  return get_state_freshness_report(timeout_sec).required_streams_fresh;
+}
+
+StateFreshnessReport AimdkController::get_state_freshness_report(double timeout_sec) {
   if (timeout_sec <= 0.0) {
     throw std::invalid_argument("state freshness timeout must be positive");
   }
 
+  StateFreshnessReport report;
   std::lock_guard<std::mutex> lock(state_mutex_);
-  if (!imu_received_ || received_joint_names_.size() != cfg_.joint_names.size()) {
-    return false;
-  }
   const auto now = std::chrono::steady_clock::now();
-  const auto cutoff = now - std::chrono::duration<double>(timeout_sec);
-  if (imu_update_time_ < cutoff) {
-    return false;
+  report.imu_received = imu_received_;
+  if (imu_received_) {
+    report.imu_age_sec = std::chrono::duration<double>(now - imu_update_time_).count();
+    if (*report.imu_age_sec > timeout_sec) {
+      report.reasons.push_back("imu_stale");
+    }
+  } else {
+    report.reasons.push_back("imu_missing");
   }
-  const auto odometry_cutoff = now - std::chrono::duration<double>(cfg_.odometry_timeout);
-  if (cfg_.enable_odometry &&
-      (!odometry_received_ || !state_.odometry_state.valid || odometry_update_time_ < odometry_cutoff)) {
-    return false;
-  }
+
   for (const auto& name : cfg_.joint_names) {
     const auto it = joint_update_times_.find(name);
-    if (it == joint_update_times_.end() || it->second < cutoff) {
-      return false;
+    if (it == joint_update_times_.end()) {
+      report.missing_joint_names.push_back(name);
+      continue;
+    }
+    const double age_sec = std::chrono::duration<double>(now - it->second).count();
+    report.joint_age_sec[name] = age_sec;
+    if (age_sec > timeout_sec) {
+      report.stale_joint_names.push_back(name);
     }
   }
-  return true;
+  if (!report.missing_joint_names.empty()) report.reasons.push_back("joints_missing");
+  if (!report.stale_joint_names.empty()) report.reasons.push_back("joints_stale");
+
+  report.odometry_required = cfg_.enable_odometry;
+  report.odometry_received = odometry_received_;
+  report.odometry_valid = state_.odometry_state.valid;
+  report.odometry_degenerate = state_.odometry_state.degenerate;
+  if (odometry_received_) {
+    report.odometry_age_sec = std::chrono::duration<double>(now - odometry_update_time_).count();
+  }
+  report.last_odometry_rejection_reason = last_odometry_rejection_reason_;
+  if (!last_odometry_rejection_reason_.empty()) {
+    report.last_odometry_rejection_age_sec =
+        std::chrono::duration<double>(now - last_odometry_rejection_time_).count();
+  }
+  if (cfg_.enable_odometry) {
+    if (!odometry_received_) {
+      report.reasons.push_back("odometry_missing");
+    } else if (!state_.odometry_state.valid) {
+      report.reasons.push_back("odometry_invalid");
+    } else if (*report.odometry_age_sec > cfg_.odometry_timeout) {
+      report.reasons.push_back("odometry_stale");
+    }
+  }
+
+  report.required_streams_fresh = report.reasons.empty();
+  return report;
 }
 
 RobotState AimdkController::get_robot_state() {
@@ -371,6 +410,11 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
       std::isfinite(linear.x) && std::isfinite(linear.y) && std::isfinite(linear.z) &&
       std::isfinite(angular.x) && std::isfinite(angular.y) && std::isfinite(angular.z);
   if (!finite || !std::isfinite(quaternion_norm) || quaternion_norm < 1e-6) {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      last_odometry_rejection_reason_ = "invalid_values_or_quaternion";
+      last_odometry_rejection_time_ = std::chrono::steady_clock::now();
+    }
     RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 2000,
         "Ignoring invalid AimDK odometry sample from %s", cfg_.odometry_topic.c_str());
@@ -378,6 +422,11 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
   }
   if ((!cfg_.odometry_parent_frame.empty() && msg->header.frame_id != cfg_.odometry_parent_frame) ||
       (!cfg_.odometry_child_frame.empty() && msg->child_frame_id != cfg_.odometry_child_frame)) {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      last_odometry_rejection_reason_ = "frame_mismatch";
+      last_odometry_rejection_time_ = std::chrono::steady_clock::now();
+    }
     RCLCPP_WARN_THROTTLE(
         node_->get_logger(), *node_->get_clock(), 2000,
         "Ignoring odometry with frames %s -> %s; expected %s -> %s",
