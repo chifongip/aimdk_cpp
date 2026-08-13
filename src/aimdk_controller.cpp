@@ -1,9 +1,11 @@
 #include "aimdk_controller.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -58,10 +60,10 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
       latest_positions_(cfg.joint_names.size(), 0.0) {
   if (!std::isfinite(cfg_.control_dt) || !std::isfinite(cfg_.publish_dt) ||
       !std::isfinite(cfg_.command_timeout) || !std::isfinite(cfg_.state_timeout) ||
-      !std::isfinite(cfg_.odometry_timeout) ||
+      !std::isfinite(cfg_.odometry_timeout) || !std::isfinite(cfg_.telemetry_window_sec) ||
       !std::isfinite(cfg_.shutdown_publish_duration) || !std::isfinite(cfg_.shutdown_damping) ||
       cfg_.control_dt <= 0.0 || cfg_.publish_dt <= 0.0 || cfg_.command_timeout <= 0.0 ||
-      cfg_.state_timeout <= 0.0 || cfg_.odometry_timeout <= 0.0 ||
+      cfg_.state_timeout <= 0.0 || cfg_.odometry_timeout <= 0.0 || cfg_.telemetry_window_sec <= 0.0 ||
       cfg_.shutdown_publish_duration < 0.0 || cfg_.shutdown_damping < 0.0) {
     throw std::invalid_argument("AimDK timing values must be positive and damping values must be non-negative");
   }
@@ -97,6 +99,15 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
     throw std::invalid_argument("joint groups must contain every configured joint exactly once");
   }
 
+  stream_telemetry_.emplace("leg", StreamTelemetryState{cfg_.leg_state_topic});
+  stream_telemetry_.emplace("waist", StreamTelemetryState{cfg_.waist_state_topic});
+  stream_telemetry_.emplace("arm", StreamTelemetryState{cfg_.arm_state_topic});
+  stream_telemetry_.emplace("head", StreamTelemetryState{cfg_.head_state_topic});
+  stream_telemetry_.emplace("imu", StreamTelemetryState{cfg_.base_imu_topic});
+  if (cfg_.enable_odometry) {
+    stream_telemetry_.emplace("odometry", StreamTelemetryState{cfg_.odometry_topic});
+  }
+
   init_rclcpp_once();
   rclcpp_registered_ = true;
   try {
@@ -106,16 +117,16 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
 
     leg_sub_ = node_->create_subscription<aimdk_msgs::msg::JointStateArray>(
         cfg_.leg_state_topic, qos,
-        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg); });
+        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg, "leg"); });
     waist_sub_ = node_->create_subscription<aimdk_msgs::msg::JointStateArray>(
         cfg_.waist_state_topic, qos,
-        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg); });
+        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg, "waist"); });
     arm_sub_ = node_->create_subscription<aimdk_msgs::msg::JointStateArray>(
         cfg_.arm_state_topic, qos,
-        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg); });
+        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg, "arm"); });
     head_sub_ = node_->create_subscription<aimdk_msgs::msg::JointStateArray>(
         cfg_.head_state_topic, qos,
-        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg); });
+        [this](const aimdk_msgs::msg::JointStateArray::SharedPtr msg) { joint_callback(msg, "head"); });
     imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
         cfg_.base_imu_topic, qos, [this](const sensor_msgs::msg::Imu::SharedPtr msg) { imu_callback(msg); });
     if (cfg_.enable_odometry) {
@@ -252,8 +263,86 @@ StateFreshnessReport AimdkController::get_state_freshness_report(double timeout_
     }
   }
 
+  append_stream_telemetry(report, now);
   report.required_streams_fresh = report.reasons.empty();
   return report;
+}
+
+void AimdkController::record_stream_telemetry(const std::string& stream_name,
+                                              std::chrono::steady_clock::time_point receive_time,
+                                              StreamMessageMetadata metadata) {
+  auto& telemetry = stream_telemetry_.at(stream_name);
+  if (telemetry.received) {
+    const double inter_arrival_sec =
+        std::chrono::duration<double>(receive_time - telemetry.last_receive_time).count();
+    telemetry.last_inter_arrival_sec = inter_arrival_sec;
+    telemetry.max_inter_arrival_sec = telemetry.max_inter_arrival_sec
+                                          ? std::max(*telemetry.max_inter_arrival_sec, inter_arrival_sec)
+                                          : inter_arrival_sec;
+  }
+  telemetry.received = true;
+  telemetry.last_receive_time = receive_time;
+  ++telemetry.received_count;
+  telemetry.recent_receive_times.push_back(receive_time);
+
+  const auto window_start = receive_time - std::chrono::duration<double>(cfg_.telemetry_window_sec);
+  while (!telemetry.recent_receive_times.empty() && telemetry.recent_receive_times.front() < window_start) {
+    telemetry.recent_receive_times.pop_front();
+  }
+
+  if (metadata.sequence) {
+    if (telemetry.last_sequence) {
+      const uint32_t delta = *metadata.sequence - *telemetry.last_sequence;
+      if (delta == 0 || delta > std::numeric_limits<uint32_t>::max() / 2) {
+        ++telemetry.sequence_nonmonotonic_count;
+      } else if (delta > 1) {
+        telemetry.sequence_gap_count += static_cast<uint64_t>(delta - 1);
+      }
+    }
+    telemetry.last_sequence = metadata.sequence;
+  }
+  telemetry.last_header_stamp_sec = metadata.header_stamp_sec;
+  telemetry.last_header_stamp_nanosec = metadata.header_stamp_nanosec;
+  telemetry.last_measurement_stamp_sec = metadata.measurement_stamp_sec;
+  telemetry.last_measurement_stamp_nanosec = metadata.measurement_stamp_nanosec;
+  telemetry.last_joint_names = std::move(metadata.joint_names);
+}
+
+void AimdkController::append_stream_telemetry(StateFreshnessReport& report,
+                                              std::chrono::steady_clock::time_point now) {
+  const auto window_start = now - std::chrono::duration<double>(cfg_.telemetry_window_sec);
+  for (auto& [stream_name, telemetry] : stream_telemetry_) {
+    while (!telemetry.recent_receive_times.empty() && telemetry.recent_receive_times.front() < window_start) {
+      telemetry.recent_receive_times.pop_front();
+    }
+
+    StateStreamTelemetry snapshot;
+    snapshot.topic = telemetry.topic;
+    snapshot.received_count = telemetry.received_count;
+    if (telemetry.received) {
+      snapshot.last_receive_age_sec = std::chrono::duration<double>(now - telemetry.last_receive_time).count();
+    }
+    if (telemetry.recent_receive_times.size() >= 2) {
+      const double sample_span_sec = std::chrono::duration<double>(
+                                         telemetry.recent_receive_times.back() - telemetry.recent_receive_times.front())
+                                         .count();
+      if (sample_span_sec > 0.0) {
+        snapshot.receive_rate_hz =
+            static_cast<double>(telemetry.recent_receive_times.size() - 1) / sample_span_sec;
+      }
+    }
+    snapshot.last_inter_arrival_sec = telemetry.last_inter_arrival_sec;
+    snapshot.max_inter_arrival_sec = telemetry.max_inter_arrival_sec;
+    snapshot.sequence_gap_count = telemetry.sequence_gap_count;
+    snapshot.sequence_nonmonotonic_count = telemetry.sequence_nonmonotonic_count;
+    snapshot.last_sequence = telemetry.last_sequence;
+    snapshot.last_header_stamp_sec = telemetry.last_header_stamp_sec;
+    snapshot.last_header_stamp_nanosec = telemetry.last_header_stamp_nanosec;
+    snapshot.last_measurement_stamp_sec = telemetry.last_measurement_stamp_sec;
+    snapshot.last_measurement_stamp_nanosec = telemetry.last_measurement_stamp_nanosec;
+    snapshot.last_joint_names = telemetry.last_joint_names;
+    report.stream_telemetry.emplace(stream_name, std::move(snapshot));
+  }
 }
 
 RobotState AimdkController::get_robot_state() {
@@ -355,10 +444,19 @@ void AimdkController::shutdown() {
   running_ = false;
 }
 
-void AimdkController::joint_callback(const aimdk_msgs::msg::JointStateArray::SharedPtr msg) {
+void AimdkController::joint_callback(const aimdk_msgs::msg::JointStateArray::SharedPtr msg,
+                                     const std::string& stream_name) {
   std::lock_guard<std::mutex> lock(state_mutex_);
   const auto update_time = std::chrono::steady_clock::now();
+  StreamMessageMetadata metadata;
+  metadata.sequence = msg->header.sequence;
+  metadata.header_stamp_sec = static_cast<int64_t>(msg->header.stamp.sec);
+  metadata.header_stamp_nanosec = msg->header.stamp.nanosec;
+  metadata.measurement_stamp_sec = static_cast<int64_t>(msg->header.meas_stamp.sec);
+  metadata.measurement_stamp_nanosec = msg->header.meas_stamp.nanosec;
+  metadata.joint_names.reserve(msg->joints.size());
   for (const auto& joint : msg->joints) {
+    metadata.joint_names.push_back(joint.name);
     auto it = joint_index_.find(joint.name);
     if (it == joint_index_.end()) {
       continue;
@@ -370,13 +468,19 @@ void AimdkController::joint_callback(const aimdk_msgs::msg::JointStateArray::Sha
     received_joint_names_.insert(joint.name);
     joint_update_times_[joint.name] = update_time;
   }
+  record_stream_telemetry(stream_name, update_time, std::move(metadata));
   ++state_.tick;
 }
 
 void AimdkController::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   std::lock_guard<std::mutex> lock(state_mutex_);
+  const auto update_time = std::chrono::steady_clock::now();
+  StreamMessageMetadata metadata;
+  metadata.header_stamp_sec = static_cast<int64_t>(msg->header.stamp.sec);
+  metadata.header_stamp_nanosec = msg->header.stamp.nanosec;
+  record_stream_telemetry("imu", update_time, std::move(metadata));
   imu_received_ = true;
-  imu_update_time_ = std::chrono::steady_clock::now();
+  imu_update_time_ = update_time;
   state_.imu_state.quaternion = {
       static_cast<float>(msg->orientation.x),
       static_cast<float>(msg->orientation.y),
@@ -396,6 +500,15 @@ void AimdkController::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
 }
 
 void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const auto update_time = std::chrono::steady_clock::now();
+    StreamMessageMetadata metadata;
+    metadata.header_stamp_sec = static_cast<int64_t>(msg->header.stamp.sec);
+    metadata.header_stamp_nanosec = msg->header.stamp.nanosec;
+    record_stream_telemetry("odometry", update_time, std::move(metadata));
+  }
+
   const auto& position = msg->pose.pose.position;
   const auto& orientation = msg->pose.pose.orientation;
   const auto& linear = msg->twist.twist.linear;
