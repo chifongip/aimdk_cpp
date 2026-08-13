@@ -3,6 +3,7 @@
 #include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <aimdk_msgs/msg/joint_state_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -152,10 +154,12 @@ class AimdkController {
  private:
   AimdkConfig cfg_;
   rclcpp::Node::SharedPtr node_;
-  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+  std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
+  rclcpp::CallbackGroup::SharedPtr joint_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr odometry_callback_group_;
   std::thread spin_thread_;
   std::thread publish_thread_;
-  std::atomic<bool> running_{false};
   std::atomic<bool> publish_running_{false};
   std::atomic<bool> shutdown_started_{false};
   bool rclcpp_registered_{false};
@@ -172,7 +176,9 @@ class AimdkController {
   rclcpp::Publisher<aimdk_msgs::msg::JointCommandArray>::SharedPtr arm_pub_;
   rclcpp::Publisher<aimdk_msgs::msg::JointCommandArray>::SharedPtr head_pub_;
 
-  std::mutex state_mutex_;
+  std::mutex joint_state_mutex_;
+  std::mutex imu_state_mutex_;
+  std::mutex odometry_state_mutex_;
   std::mutex command_mutex_;
   std::map<std::string, size_t> joint_index_;
   std::set<std::string> command_joint_names_;
@@ -230,7 +236,8 @@ class AimdkController {
                                std::chrono::steady_clock::time_point receive_time,
                                StreamMessageMetadata metadata);
   void append_stream_telemetry(StateFreshnessReport& report,
-                               std::chrono::steady_clock::time_point now);
+                               std::chrono::steady_clock::time_point now,
+                               std::initializer_list<const char*> stream_names);
   void publish_loop();
   void publish_passive_commands();
   void publish_damping_commands();
