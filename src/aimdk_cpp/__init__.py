@@ -6,6 +6,7 @@ from .aimdk_cpp import (
     OdometryState,
     RobotState,
     StateFreshnessReport,
+    StateStreamTelemetry,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "OdometryState",
     "RobotState",
     "StateFreshnessReport",
+    "StateStreamTelemetry",
 ]

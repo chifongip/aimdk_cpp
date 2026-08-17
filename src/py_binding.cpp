@@ -20,6 +20,9 @@ AimdkConfig config_from_dict(py::dict cfg_dict) {
   if (cfg_dict.contains("odometry_timeout")) {
     cfg.odometry_timeout = cfg_dict["odometry_timeout"].cast<double>();
   }
+  if (cfg_dict.contains("telemetry_window_sec")) {
+    cfg.telemetry_window_sec = cfg_dict["telemetry_window_sec"].cast<double>();
+  }
   if (cfg_dict.contains("base_imu_topic")) cfg.base_imu_topic = cfg_dict["base_imu_topic"].cast<std::string>();
   if (cfg_dict.contains("enable_odometry")) cfg.enable_odometry = cfg_dict["enable_odometry"].cast<bool>();
   if (cfg_dict.contains("odometry_topic")) cfg.odometry_topic = cfg_dict["odometry_topic"].cast<std::string>();
@@ -68,6 +71,7 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("shutdown_publish_duration", &AimdkConfig::shutdown_publish_duration)
       .def_readwrite("state_timeout", &AimdkConfig::state_timeout)
       .def_readwrite("odometry_timeout", &AimdkConfig::odometry_timeout)
+      .def_readwrite("telemetry_window_sec", &AimdkConfig::telemetry_window_sec)
       .def_readwrite("base_imu_topic", &AimdkConfig::base_imu_topic)
       .def_readwrite("enable_odometry", &AimdkConfig::enable_odometry)
       .def_readwrite("odometry_topic", &AimdkConfig::odometry_topic)
@@ -115,6 +119,23 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("imu_state", &RobotState::imu_state)
       .def_readwrite("odometry_state", &RobotState::odometry_state);
 
+  py::class_<StateStreamTelemetry>(m, "StateStreamTelemetry", py::module_local())
+      .def(py::init<>())
+      .def_readwrite("topic", &StateStreamTelemetry::topic)
+      .def_readwrite("received_count", &StateStreamTelemetry::received_count)
+      .def_readwrite("last_receive_age_sec", &StateStreamTelemetry::last_receive_age_sec)
+      .def_readwrite("receive_rate_hz", &StateStreamTelemetry::receive_rate_hz)
+      .def_readwrite("last_inter_arrival_sec", &StateStreamTelemetry::last_inter_arrival_sec)
+      .def_readwrite("max_inter_arrival_sec", &StateStreamTelemetry::max_inter_arrival_sec)
+      .def_readwrite("sequence_gap_count", &StateStreamTelemetry::sequence_gap_count)
+      .def_readwrite("sequence_nonmonotonic_count", &StateStreamTelemetry::sequence_nonmonotonic_count)
+      .def_readwrite("last_sequence", &StateStreamTelemetry::last_sequence)
+      .def_readwrite("last_header_stamp_sec", &StateStreamTelemetry::last_header_stamp_sec)
+      .def_readwrite("last_header_stamp_nanosec", &StateStreamTelemetry::last_header_stamp_nanosec)
+      .def_readwrite("last_measurement_stamp_sec", &StateStreamTelemetry::last_measurement_stamp_sec)
+      .def_readwrite("last_measurement_stamp_nanosec", &StateStreamTelemetry::last_measurement_stamp_nanosec)
+      .def_readwrite("last_joint_names", &StateStreamTelemetry::last_joint_names);
+
   py::class_<StateFreshnessReport>(m, "StateFreshnessReport", py::module_local())
       .def(py::init<>())
       .def_readwrite("required_streams_fresh", &StateFreshnessReport::required_streams_fresh)
@@ -131,6 +152,7 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("last_odometry_rejection_reason", &StateFreshnessReport::last_odometry_rejection_reason)
       .def_readwrite(
           "last_odometry_rejection_age_sec", &StateFreshnessReport::last_odometry_rejection_age_sec)
+      .def_readwrite("stream_telemetry", &StateFreshnessReport::stream_telemetry)
       .def_readwrite("reasons", &StateFreshnessReport::reasons);
 
   py::class_<AimdkController>(m, "AimdkController")

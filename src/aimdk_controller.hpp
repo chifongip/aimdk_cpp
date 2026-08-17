@@ -3,11 +3,15 @@
 #include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <aimdk_msgs/msg/joint_state_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <deque>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -27,6 +31,7 @@ struct AimdkConfig {
   double shutdown_publish_duration{0.2};
   double state_timeout{0.1};
   double odometry_timeout{0.1};
+  double telemetry_window_sec{1.0};
   std::string base_imu_topic{"/aima/hal/imu/torso/state"};
   bool enable_odometry{false};
   std::string odometry_topic{"/aima/mc/leg_odometry"};
@@ -92,6 +97,23 @@ struct RobotState {
   explicit RobotState(size_t num_motors = 0) : motor_state(num_motors) {}
 };
 
+struct StateStreamTelemetry {
+  std::string topic;
+  uint64_t received_count{0};
+  std::optional<double> last_receive_age_sec;
+  std::optional<double> receive_rate_hz;
+  std::optional<double> last_inter_arrival_sec;
+  std::optional<double> max_inter_arrival_sec;
+  uint64_t sequence_gap_count{0};
+  uint64_t sequence_nonmonotonic_count{0};
+  std::optional<uint32_t> last_sequence;
+  std::optional<int64_t> last_header_stamp_sec;
+  std::optional<uint32_t> last_header_stamp_nanosec;
+  std::optional<int64_t> last_measurement_stamp_sec;
+  std::optional<uint32_t> last_measurement_stamp_nanosec;
+  std::vector<std::string> last_joint_names;
+};
+
 struct StateFreshnessReport {
   bool required_streams_fresh{false};
   bool imu_received{false};
@@ -106,6 +128,7 @@ struct StateFreshnessReport {
   std::optional<double> odometry_age_sec;
   std::string last_odometry_rejection_reason;
   std::optional<double> last_odometry_rejection_age_sec;
+  std::map<std::string, StateStreamTelemetry> stream_telemetry;
   std::vector<std::string> reasons;
 };
 
@@ -131,10 +154,12 @@ class AimdkController {
  private:
   AimdkConfig cfg_;
   rclcpp::Node::SharedPtr node_;
-  std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor_;
+  std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
+  rclcpp::CallbackGroup::SharedPtr joint_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr odometry_callback_group_;
   std::thread spin_thread_;
   std::thread publish_thread_;
-  std::atomic<bool> running_{false};
   std::atomic<bool> publish_running_{false};
   std::atomic<bool> shutdown_started_{false};
   bool rclcpp_registered_{false};
@@ -151,7 +176,9 @@ class AimdkController {
   rclcpp::Publisher<aimdk_msgs::msg::JointCommandArray>::SharedPtr arm_pub_;
   rclcpp::Publisher<aimdk_msgs::msg::JointCommandArray>::SharedPtr head_pub_;
 
-  std::mutex state_mutex_;
+  std::mutex joint_state_mutex_;
+  std::mutex imu_state_mutex_;
+  std::mutex odometry_state_mutex_;
   std::mutex command_mutex_;
   std::map<std::string, size_t> joint_index_;
   std::set<std::string> command_joint_names_;
@@ -173,9 +200,44 @@ class AimdkController {
   double mode_damping_{5.0};
   bool watchdog_tripped_{false};
 
-  void joint_callback(const aimdk_msgs::msg::JointStateArray::SharedPtr msg);
+  struct StreamTelemetryState {
+    std::string topic;
+    uint64_t received_count{0};
+    bool received{false};
+    std::chrono::steady_clock::time_point last_receive_time{};
+    std::deque<std::chrono::steady_clock::time_point> recent_receive_times;
+    std::optional<double> last_inter_arrival_sec;
+    std::optional<double> max_inter_arrival_sec;
+    uint64_t sequence_gap_count{0};
+    uint64_t sequence_nonmonotonic_count{0};
+    std::optional<uint32_t> last_sequence;
+    std::optional<int64_t> last_header_stamp_sec;
+    std::optional<uint32_t> last_header_stamp_nanosec;
+    std::optional<int64_t> last_measurement_stamp_sec;
+    std::optional<uint32_t> last_measurement_stamp_nanosec;
+    std::vector<std::string> last_joint_names;
+  };
+
+  struct StreamMessageMetadata {
+    std::optional<uint32_t> sequence;
+    std::optional<int64_t> header_stamp_sec;
+    std::optional<uint32_t> header_stamp_nanosec;
+    std::optional<int64_t> measurement_stamp_sec;
+    std::optional<uint32_t> measurement_stamp_nanosec;
+    std::vector<std::string> joint_names;
+  };
+
+  std::map<std::string, StreamTelemetryState> stream_telemetry_;
+
+  void joint_callback(const aimdk_msgs::msg::JointStateArray::SharedPtr msg, const std::string& stream_name);
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void odometry_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
+  void record_stream_telemetry(const std::string& stream_name,
+                               std::chrono::steady_clock::time_point receive_time,
+                               StreamMessageMetadata metadata);
+  void append_stream_telemetry(StateFreshnessReport& report,
+                               std::chrono::steady_clock::time_point now,
+                               std::initializer_list<const char*> stream_names);
   void publish_loop();
   void publish_passive_commands();
   void publish_damping_commands();
