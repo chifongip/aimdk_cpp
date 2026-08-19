@@ -27,10 +27,13 @@ struct AimdkConfig {
   double control_dt{0.02};
   double publish_dt{0.002};
   double command_timeout{0.1};
+  double command_damping_timeout{0.1};
   double shutdown_damping{5.0};
   double shutdown_publish_duration{0.2};
   double state_timeout{0.1};
+  double state_damping_timeout{0.1};
   double odometry_timeout{0.1};
+  double odometry_damping_timeout{0.1};
   double telemetry_window_sec{1.0};
   std::string base_imu_topic{"/aima/hal/imu/torso/state"};
   bool enable_odometry{false};
@@ -133,6 +136,16 @@ struct StateFreshnessReport {
 };
 
 enum class AimdkCommandMode { IDLE, POSITION, PASSIVE, DAMPING };
+enum class AimdkSafetyState { ACTIVE, HOLD, DAMPING };
+enum class AimdkSafetyFault { NONE, COMMAND_TIMEOUT, STATE_TIMEOUT, INVALID_STATE };
+
+struct AimdkSafetyStatus {
+  std::string state;
+  std::string fault;
+  bool latched{false};
+  std::optional<double> command_age_sec;
+  double state_age_sec{0.0};
+};
 
 class AimdkController {
  public:
@@ -141,7 +154,8 @@ class AimdkController {
 
   bool self_check(double timeout_sec = 2.0);
   bool state_is_fresh(double timeout_sec);
-  StateFreshnessReport get_state_freshness_report(double timeout_sec);
+  StateFreshnessReport get_state_freshness_report(double timeout_sec, double odometry_timeout_sec = 0.0);
+  AimdkSafetyStatus get_safety_status();
   RobotState get_robot_state();
   void step(const std::vector<double>& positions);
   void arm_position_control();
@@ -194,11 +208,19 @@ class AimdkController {
   std::vector<double> stiffness_;
   std::vector<double> damping_;
   std::vector<double> latest_positions_;
+  std::vector<double> hold_positions_;
   std::chrono::steady_clock::time_point last_command_time_{};
   bool command_received_{false};
   AimdkCommandMode command_mode_{AimdkCommandMode::IDLE};
   double mode_damping_{5.0};
   bool watchdog_tripped_{false};
+  AimdkSafetyState safety_state_{AimdkSafetyState::ACTIVE};
+  AimdkSafetyFault safety_fault_{AimdkSafetyFault::NONE};
+  std::chrono::steady_clock::time_point safety_state_since_{};
+  uint64_t command_generation_{0};
+  uint64_t hold_command_generation_{0};
+  uint64_t recovery_command_generation_{0};
+  bool state_recovery_confirmed_{false};
 
   struct StreamTelemetryState {
     std::string topic;
@@ -238,8 +260,12 @@ class AimdkController {
   void append_stream_telemetry(StateFreshnessReport& report,
                                std::chrono::steady_clock::time_point now,
                                std::initializer_list<const char*> stream_names);
+  void evaluate_safety_locked(std::chrono::steady_clock::time_point now);
+  void enter_hold_locked(AimdkSafetyFault fault, std::chrono::steady_clock::time_point now);
+  void enter_damping_locked(AimdkSafetyFault fault, std::chrono::steady_clock::time_point now);
   void publish_loop();
   void publish_passive_commands();
+  void publish_hold_commands();
   void publish_damping_commands();
   void publish_group(const std::vector<std::string>& names,
                      const std::vector<double>& positions,
