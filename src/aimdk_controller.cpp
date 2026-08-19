@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 std::atomic<int> g_controller_count{0};
@@ -50,6 +51,36 @@ void validate_gains(const std::vector<double>& stiffness,
     }
   }
 }
+
+bool fits_float(double value) {
+  return std::isfinite(value) && std::abs(value) <= std::numeric_limits<float>::max();
+}
+
+const char* safety_state_name(AimdkSafetyState state) {
+  switch (state) {
+    case AimdkSafetyState::ACTIVE:
+      return "ACTIVE";
+    case AimdkSafetyState::HOLD:
+      return "HOLD";
+    case AimdkSafetyState::DAMPING:
+      return "DAMPING";
+  }
+  return "UNKNOWN";
+}
+
+const char* safety_fault_name(AimdkSafetyFault fault) {
+  switch (fault) {
+    case AimdkSafetyFault::NONE:
+      return "NONE";
+    case AimdkSafetyFault::COMMAND_TIMEOUT:
+      return "COMMAND_TIMEOUT";
+    case AimdkSafetyFault::STATE_TIMEOUT:
+      return "STATE_TIMEOUT";
+    case AimdkSafetyFault::INVALID_STATE:
+      return "INVALID_STATE";
+  }
+  return "UNKNOWN";
+}
 }  // namespace
 
 AimdkController::AimdkController(const AimdkConfig& cfg)
@@ -57,15 +88,26 @@ AimdkController::AimdkController(const AimdkConfig& cfg)
       state_(cfg.joint_names.size()),
       stiffness_(cfg.stiffness),
       damping_(cfg.damping),
-      latest_positions_(cfg.joint_names.size(), 0.0) {
+      latest_positions_(cfg.joint_names.size(), 0.0),
+      hold_positions_(cfg.joint_names.size(), 0.0),
+      safety_state_since_(std::chrono::steady_clock::now()) {
   if (!std::isfinite(cfg_.control_dt) || !std::isfinite(cfg_.publish_dt) ||
-      !std::isfinite(cfg_.command_timeout) || !std::isfinite(cfg_.state_timeout) ||
-      !std::isfinite(cfg_.odometry_timeout) || !std::isfinite(cfg_.telemetry_window_sec) ||
+      !std::isfinite(cfg_.command_timeout) || !std::isfinite(cfg_.command_damping_timeout) ||
+      !std::isfinite(cfg_.state_timeout) || !std::isfinite(cfg_.state_damping_timeout) ||
+      !std::isfinite(cfg_.odometry_timeout) || !std::isfinite(cfg_.odometry_damping_timeout) ||
+      !std::isfinite(cfg_.telemetry_window_sec) ||
       !std::isfinite(cfg_.shutdown_publish_duration) || !std::isfinite(cfg_.shutdown_damping) ||
       cfg_.control_dt <= 0.0 || cfg_.publish_dt <= 0.0 || cfg_.command_timeout <= 0.0 ||
-      cfg_.state_timeout <= 0.0 || cfg_.odometry_timeout <= 0.0 || cfg_.telemetry_window_sec <= 0.0 ||
+      cfg_.command_damping_timeout <= 0.0 || cfg_.state_timeout <= 0.0 ||
+      cfg_.state_damping_timeout <= 0.0 || cfg_.odometry_timeout <= 0.0 ||
+      cfg_.odometry_damping_timeout <= 0.0 || cfg_.telemetry_window_sec <= 0.0 ||
       cfg_.shutdown_publish_duration < 0.0 || cfg_.shutdown_damping < 0.0) {
     throw std::invalid_argument("AimDK timing values must be positive and damping values must be non-negative");
+  }
+  if (cfg_.command_damping_timeout < cfg_.command_timeout ||
+      cfg_.state_damping_timeout < cfg_.state_timeout ||
+      cfg_.odometry_damping_timeout < cfg_.odometry_timeout) {
+    throw std::invalid_argument("AimDK damping timeouts must not be shorter than their hold timeouts");
   }
   validate_gains(cfg_.stiffness, cfg_.damping, cfg_.joint_names.size());
   if (cfg_.enable_odometry && cfg_.odometry_topic.empty()) {
@@ -217,9 +259,15 @@ bool AimdkController::state_is_fresh(double timeout_sec) {
   return get_state_freshness_report(timeout_sec).required_streams_fresh;
 }
 
-StateFreshnessReport AimdkController::get_state_freshness_report(double timeout_sec) {
-  if (timeout_sec <= 0.0) {
-    throw std::invalid_argument("state freshness timeout must be positive");
+StateFreshnessReport AimdkController::get_state_freshness_report(
+    double timeout_sec, double odometry_timeout_sec) {
+  if (!std::isfinite(timeout_sec) || timeout_sec <= 0.0) {
+    throw std::invalid_argument("state freshness timeout must be finite and positive");
+  }
+  const double effective_odometry_timeout =
+      odometry_timeout_sec > 0.0 ? odometry_timeout_sec : cfg_.odometry_timeout;
+  if (!std::isfinite(effective_odometry_timeout) || effective_odometry_timeout <= 0.0) {
+    throw std::invalid_argument("odometry freshness timeout must be finite and positive");
   }
 
   StateFreshnessReport report;
@@ -276,7 +324,7 @@ StateFreshnessReport AimdkController::get_state_freshness_report(double timeout_
         report.reasons.push_back("odometry_missing");
       } else if (!state_.odometry_state.valid) {
         report.reasons.push_back("odometry_invalid");
-      } else if (*report.odometry_age_sec > cfg_.odometry_timeout) {
+      } else if (*report.odometry_age_sec > effective_odometry_timeout) {
         report.reasons.push_back("odometry_stale");
       }
       append_stream_telemetry(report, now, {"odometry"});
@@ -285,6 +333,20 @@ StateFreshnessReport AimdkController::get_state_freshness_report(double timeout_
 
   report.required_streams_fresh = report.reasons.empty();
   return report;
+}
+
+AimdkSafetyStatus AimdkController::get_safety_status() {
+  std::lock_guard<std::mutex> lock(command_mutex_);
+  const auto now = std::chrono::steady_clock::now();
+  AimdkSafetyStatus status;
+  status.state = safety_state_name(safety_state_);
+  status.fault = safety_fault_name(safety_fault_);
+  status.latched = watchdog_tripped_;
+  if (command_received_) {
+    status.command_age_sec = std::chrono::duration<double>(now - last_command_time_).count();
+  }
+  status.state_age_sec = std::chrono::duration<double>(now - safety_state_since_).count();
+  return status;
 }
 
 void AimdkController::record_stream_telemetry(const std::string& stream_name,
@@ -397,11 +459,17 @@ void AimdkController::step(const std::vector<double>& positions) {
     }
   }
   std::lock_guard<std::mutex> lock(command_mutex_);
+  const auto now = std::chrono::steady_clock::now();
+  // Check the previous command's age before replacing its timestamp after a host stall.
+  if (command_received_ && command_mode_ == AimdkCommandMode::POSITION) {
+    evaluate_safety_locked(now);
+  }
   if (watchdog_tripped_) {
     throw std::runtime_error("AimDK position watchdog is latched; re-arm position control before sending targets");
   }
   latest_positions_ = positions;
-  last_command_time_ = std::chrono::steady_clock::now();
+  last_command_time_ = now;
+  ++command_generation_;
   command_received_ = true;
   command_mode_ = AimdkCommandMode::POSITION;
 }
@@ -412,6 +480,10 @@ void AimdkController::arm_position_control() {
   }
   std::lock_guard<std::mutex> lock(command_mutex_);
   watchdog_tripped_ = false;
+  safety_state_ = AimdkSafetyState::ACTIVE;
+  safety_fault_ = AimdkSafetyFault::NONE;
+  safety_state_since_ = std::chrono::steady_clock::now();
+  state_recovery_confirmed_ = false;
   command_received_ = false;
   command_mode_ = AimdkCommandMode::IDLE;
 }
@@ -421,6 +493,12 @@ void AimdkController::set_passive() {
     return;
   }
   std::lock_guard<std::mutex> lock(command_mutex_);
+  if (!watchdog_tripped_) {
+    safety_state_ = AimdkSafetyState::ACTIVE;
+    safety_fault_ = AimdkSafetyFault::NONE;
+    safety_state_since_ = std::chrono::steady_clock::now();
+    state_recovery_confirmed_ = false;
+  }
   command_mode_ = AimdkCommandMode::PASSIVE;
   command_received_ = true;
 }
@@ -433,6 +511,12 @@ void AimdkController::set_damping(double damping) {
     return;
   }
   std::lock_guard<std::mutex> lock(command_mutex_);
+  if (!watchdog_tripped_) {
+    safety_state_ = AimdkSafetyState::ACTIVE;
+    safety_fault_ = AimdkSafetyFault::NONE;
+    safety_state_since_ = std::chrono::steady_clock::now();
+    state_recovery_confirmed_ = false;
+  }
   mode_damping_ = damping;
   command_mode_ = AimdkCommandMode::DAMPING;
   command_received_ = true;
@@ -447,13 +531,14 @@ void AimdkController::set_gains(const std::vector<double>& stiffness, const std:
 
 void AimdkController::set_control_joint_names(const std::vector<std::string>& joint_names) {
   std::lock_guard<std::mutex> lock(command_mutex_);
-  command_joint_names_.clear();
+  std::set<std::string> validated_joint_names;
   for (const auto& name : joint_names) {
     if (joint_index_.find(name) == joint_index_.end()) {
       throw std::invalid_argument("control joint name is not in joint_names: " + name);
     }
-    command_joint_names_.insert(name);
+    validated_joint_names.insert(name);
   }
+  command_joint_names_ = std::move(validated_joint_names);
 }
 
 void AimdkController::shutdown() {
@@ -466,6 +551,7 @@ void AimdkController::shutdown() {
   }
 
   if (cfg_.act && rclcpp::ok()) {
+    std::lock_guard<std::mutex> lock(command_mutex_);
     command_mode_ = AimdkCommandMode::DAMPING;
     mode_damping_ = cfg_.shutdown_damping;
     const auto deadline =
@@ -497,10 +583,19 @@ void AimdkController::joint_callback(const aimdk_msgs::msg::JointStateArray::Sha
     if (it == joint_index_.end()) {
       continue;
     }
+    if (!fits_float(joint.position) || !fits_float(joint.velocity) || !fits_float(joint.effort)) {
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 2000,
+          "Ignoring invalid AimDK joint sample for %s", joint.name.c_str());
+      continue;
+    }
+    const float position = static_cast<float>(joint.position);
+    const float velocity = static_cast<float>(joint.velocity);
+    const float effort = static_cast<float>(joint.effort);
     const size_t idx = it->second;
-    state_.motor_state.q[idx] = static_cast<float>(joint.position);
-    state_.motor_state.dq[idx] = static_cast<float>(joint.velocity);
-    state_.motor_state.tau_est[idx] = static_cast<float>(joint.effort);
+    state_.motor_state.q[idx] = position;
+    state_.motor_state.dq[idx] = velocity;
+    state_.motor_state.tau_est[idx] = effort;
     received_joint_names_.insert(joint.name);
     joint_update_times_[joint.name] = update_time;
   }
@@ -515,6 +610,24 @@ void AimdkController::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
   metadata.header_stamp_sec = static_cast<int64_t>(msg->header.stamp.sec);
   metadata.header_stamp_nanosec = msg->header.stamp.nanosec;
   record_stream_telemetry("imu", update_time, std::move(metadata));
+  const auto& orientation = msg->orientation;
+  const auto& angular_velocity = msg->angular_velocity;
+  const auto& linear_acceleration = msg->linear_acceleration;
+  const double quaternion_norm =
+      std::sqrt(orientation.x * orientation.x + orientation.y * orientation.y +
+                orientation.z * orientation.z + orientation.w * orientation.w);
+  const bool finite =
+      fits_float(orientation.x) && fits_float(orientation.y) &&
+      fits_float(orientation.z) && fits_float(orientation.w) &&
+      fits_float(angular_velocity.x) && fits_float(angular_velocity.y) &&
+      fits_float(angular_velocity.z) && fits_float(linear_acceleration.x) &&
+      fits_float(linear_acceleration.y) && fits_float(linear_acceleration.z);
+  if (!finite || !std::isfinite(quaternion_norm) || quaternion_norm < 1e-6) {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 2000,
+        "Ignoring invalid AimDK IMU sample from %s", cfg_.base_imu_topic.c_str());
+    return;
+  }
   imu_received_ = true;
   imu_update_time_ = update_time;
   state_.imu_state.quaternion = {
@@ -551,11 +664,13 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
       std::sqrt(orientation.x * orientation.x + orientation.y * orientation.y +
                 orientation.z * orientation.z + orientation.w * orientation.w);
   const bool finite =
-      std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
+      fits_float(position.x) && fits_float(position.y) && fits_float(position.z) &&
       std::isfinite(orientation.x) && std::isfinite(orientation.y) &&
       std::isfinite(orientation.z) && std::isfinite(orientation.w) &&
-      std::isfinite(linear.x) && std::isfinite(linear.y) && std::isfinite(linear.z) &&
-      std::isfinite(angular.x) && std::isfinite(angular.y) && std::isfinite(angular.z);
+      fits_float(linear.x) && fits_float(linear.y) && fits_float(linear.z) &&
+      fits_float(angular.x) && fits_float(angular.y) && fits_float(angular.z) &&
+      std::all_of(msg->pose.covariance.begin(), msg->pose.covariance.end(),
+                  [](double value) { return std::isfinite(value); });
   if (!finite || !std::isfinite(quaternion_norm) || quaternion_norm < 1e-6) {
     last_odometry_rejection_reason_ = "invalid_values_or_quaternion";
     last_odometry_rejection_time_ = std::chrono::steady_clock::now();
@@ -611,6 +726,105 @@ void AimdkController::odometry_callback(const nav_msgs::msg::Odometry::SharedPtr
       msg->pose.covariance.begin(), msg->pose.covariance.end());
 }
 
+void AimdkController::enter_hold_locked(AimdkSafetyFault fault,
+                                        std::chrono::steady_clock::time_point now) {
+  if (safety_state_ == AimdkSafetyState::DAMPING) {
+    return;
+  }
+  if (safety_state_ == AimdkSafetyState::HOLD && safety_fault_ == fault) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> state_lock(joint_state_mutex_);
+    std::transform(
+        state_.motor_state.q.begin(), state_.motor_state.q.end(), hold_positions_.begin(),
+        [](float position) { return static_cast<double>(position); });
+  }
+  if (!std::all_of(hold_positions_.begin(), hold_positions_.end(), [](double position) {
+        return std::isfinite(position);
+      })) {
+    enter_damping_locked(AimdkSafetyFault::INVALID_STATE, now);
+    return;
+  }
+  safety_state_ = AimdkSafetyState::HOLD;
+  safety_fault_ = fault;
+  safety_state_since_ = now;
+  hold_command_generation_ = command_generation_;
+  recovery_command_generation_ = command_generation_;
+  state_recovery_confirmed_ = false;
+  RCLCPP_WARN(
+      node_->get_logger(), "AimDK safety hold entered: %s", safety_fault_name(fault));
+}
+
+void AimdkController::enter_damping_locked(AimdkSafetyFault fault,
+                                           std::chrono::steady_clock::time_point now) {
+  if (safety_state_ == AimdkSafetyState::DAMPING) {
+    return;
+  }
+  watchdog_tripped_ = true;
+  command_mode_ = AimdkCommandMode::DAMPING;
+  mode_damping_ = cfg_.shutdown_damping;
+  safety_state_ = AimdkSafetyState::DAMPING;
+  safety_fault_ = fault;
+  safety_state_since_ = now;
+  RCLCPP_ERROR(
+      node_->get_logger(), "AimDK safety damping latched: %s", safety_fault_name(fault));
+}
+
+void AimdkController::evaluate_safety_locked(std::chrono::steady_clock::time_point now) {
+  if (watchdog_tripped_ || command_mode_ != AimdkCommandMode::POSITION) {
+    return;
+  }
+
+  const StateFreshnessReport hard_state = get_state_freshness_report(
+      cfg_.state_damping_timeout, cfg_.odometry_damping_timeout);
+  if (!hard_state.required_streams_fresh) {
+    enter_damping_locked(AimdkSafetyFault::STATE_TIMEOUT, now);
+    return;
+  }
+
+  const auto command_age = std::chrono::duration<double>(now - last_command_time_).count();
+  if (command_age > cfg_.command_damping_timeout) {
+    enter_damping_locked(AimdkSafetyFault::COMMAND_TIMEOUT, now);
+    return;
+  }
+
+  const StateFreshnessReport soft_state = get_state_freshness_report(
+      cfg_.state_timeout, cfg_.odometry_timeout);
+  if (!soft_state.required_streams_fresh) {
+    enter_hold_locked(AimdkSafetyFault::STATE_TIMEOUT, now);
+    state_recovery_confirmed_ = false;
+    recovery_command_generation_ = command_generation_;
+    return;
+  }
+  if (command_age > cfg_.command_timeout) {
+    enter_hold_locked(AimdkSafetyFault::COMMAND_TIMEOUT, now);
+    return;
+  }
+
+  if (safety_state_ != AimdkSafetyState::HOLD) {
+    return;
+  }
+  if (safety_fault_ == AimdkSafetyFault::STATE_TIMEOUT) {
+    if (!state_recovery_confirmed_) {
+      state_recovery_confirmed_ = true;
+      recovery_command_generation_ = command_generation_;
+      return;
+    }
+    if (command_generation_ <= recovery_command_generation_) {
+      return;
+    }
+  } else if (command_generation_ <= hold_command_generation_) {
+    return;
+  }
+
+  safety_state_ = AimdkSafetyState::ACTIVE;
+  safety_fault_ = AimdkSafetyFault::NONE;
+  safety_state_since_ = now;
+  RCLCPP_INFO(node_->get_logger(), "AimDK safety hold recovered after a fresh command");
+}
+
 void AimdkController::publish_loop() {
   auto next_publish = std::chrono::steady_clock::now();
   while (publish_running_ && rclcpp::ok()) {
@@ -620,19 +834,13 @@ void AimdkController::publish_loop() {
     {
       std::lock_guard<std::mutex> lock(command_mutex_);
       if (command_received_) {
-        const bool position_timed_out =
-            command_mode_ == AimdkCommandMode::POSITION &&
-            std::chrono::steady_clock::now() - last_command_time_ >
-                std::chrono::duration<double>(cfg_.command_timeout);
-        if (position_timed_out) {
-          watchdog_tripped_ = true;
-          command_mode_ = AimdkCommandMode::DAMPING;
-          mode_damping_ = cfg_.shutdown_damping;
+        evaluate_safety_locked(std::chrono::steady_clock::now());
+        if (safety_state_ == AimdkSafetyState::DAMPING || command_mode_ == AimdkCommandMode::DAMPING) {
           publish_damping_commands();
         } else if (command_mode_ == AimdkCommandMode::PASSIVE) {
           publish_passive_commands();
-        } else if (command_mode_ == AimdkCommandMode::DAMPING) {
-          publish_damping_commands();
+        } else if (safety_state_ == AimdkSafetyState::HOLD) {
+          publish_hold_commands();
         } else if (command_mode_ == AimdkCommandMode::POSITION) {
           publish_group(cfg_.leg_joint_names, latest_positions_, stiffness_, damping_, true, leg_pub_);
           publish_group(cfg_.waist_joint_names, latest_positions_, stiffness_, damping_, true, waist_pub_);
@@ -651,6 +859,13 @@ void AimdkController::publish_passive_commands() {
   publish_group(cfg_.waist_joint_names, zeros, zeros, zeros, false, waist_pub_);
   publish_group(cfg_.arm_joint_names, zeros, zeros, zeros, false, arm_pub_);
   publish_group(cfg_.head_joint_names, zeros, zeros, zeros, false, head_pub_);
+}
+
+void AimdkController::publish_hold_commands() {
+  publish_group(cfg_.leg_joint_names, hold_positions_, stiffness_, damping_, true, leg_pub_);
+  publish_group(cfg_.waist_joint_names, hold_positions_, stiffness_, damping_, true, waist_pub_);
+  publish_group(cfg_.arm_joint_names, hold_positions_, stiffness_, damping_, true, arm_pub_);
+  publish_group(cfg_.head_joint_names, hold_positions_, stiffness_, damping_, true, head_pub_);
 }
 
 void AimdkController::publish_damping_commands() {

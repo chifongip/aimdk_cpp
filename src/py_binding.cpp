@@ -12,13 +12,22 @@ AimdkConfig config_from_dict(py::dict cfg_dict) {
   if (cfg_dict.contains("control_dt")) cfg.control_dt = cfg_dict["control_dt"].cast<double>();
   if (cfg_dict.contains("publish_dt")) cfg.publish_dt = cfg_dict["publish_dt"].cast<double>();
   if (cfg_dict.contains("command_timeout")) cfg.command_timeout = cfg_dict["command_timeout"].cast<double>();
+  if (cfg_dict.contains("command_damping_timeout")) {
+    cfg.command_damping_timeout = cfg_dict["command_damping_timeout"].cast<double>();
+  }
   if (cfg_dict.contains("shutdown_damping")) cfg.shutdown_damping = cfg_dict["shutdown_damping"].cast<double>();
   if (cfg_dict.contains("shutdown_publish_duration")) {
     cfg.shutdown_publish_duration = cfg_dict["shutdown_publish_duration"].cast<double>();
   }
   if (cfg_dict.contains("state_timeout")) cfg.state_timeout = cfg_dict["state_timeout"].cast<double>();
+  if (cfg_dict.contains("state_damping_timeout")) {
+    cfg.state_damping_timeout = cfg_dict["state_damping_timeout"].cast<double>();
+  }
   if (cfg_dict.contains("odometry_timeout")) {
     cfg.odometry_timeout = cfg_dict["odometry_timeout"].cast<double>();
+  }
+  if (cfg_dict.contains("odometry_damping_timeout")) {
+    cfg.odometry_damping_timeout = cfg_dict["odometry_damping_timeout"].cast<double>();
   }
   if (cfg_dict.contains("telemetry_window_sec")) {
     cfg.telemetry_window_sec = cfg_dict["telemetry_window_sec"].cast<double>();
@@ -67,10 +76,13 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("control_dt", &AimdkConfig::control_dt)
       .def_readwrite("publish_dt", &AimdkConfig::publish_dt)
       .def_readwrite("command_timeout", &AimdkConfig::command_timeout)
+      .def_readwrite("command_damping_timeout", &AimdkConfig::command_damping_timeout)
       .def_readwrite("shutdown_damping", &AimdkConfig::shutdown_damping)
       .def_readwrite("shutdown_publish_duration", &AimdkConfig::shutdown_publish_duration)
       .def_readwrite("state_timeout", &AimdkConfig::state_timeout)
+      .def_readwrite("state_damping_timeout", &AimdkConfig::state_damping_timeout)
       .def_readwrite("odometry_timeout", &AimdkConfig::odometry_timeout)
+      .def_readwrite("odometry_damping_timeout", &AimdkConfig::odometry_damping_timeout)
       .def_readwrite("telemetry_window_sec", &AimdkConfig::telemetry_window_sec)
       .def_readwrite("base_imu_topic", &AimdkConfig::base_imu_topic)
       .def_readwrite("enable_odometry", &AimdkConfig::enable_odometry)
@@ -155,6 +167,14 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def_readwrite("stream_telemetry", &StateFreshnessReport::stream_telemetry)
       .def_readwrite("reasons", &StateFreshnessReport::reasons);
 
+  py::class_<AimdkSafetyStatus>(m, "AimdkSafetyStatus", py::module_local())
+      .def(py::init<>())
+      .def_readwrite("state", &AimdkSafetyStatus::state)
+      .def_readwrite("fault", &AimdkSafetyStatus::fault)
+      .def_readwrite("latched", &AimdkSafetyStatus::latched)
+      .def_readwrite("command_age_sec", &AimdkSafetyStatus::command_age_sec)
+      .def_readwrite("state_age_sec", &AimdkSafetyStatus::state_age_sec);
+
   py::class_<AimdkController>(m, "AimdkController")
       .def(py::init([](py::dict cfg_dict) { return new AimdkController(config_from_dict(cfg_dict)); }))
       .def(py::init<const AimdkConfig&>())
@@ -162,7 +182,8 @@ PYBIND11_MODULE(aimdk_cpp, m) {
       .def("state_is_fresh", &AimdkController::state_is_fresh, py::arg("timeout_sec"))
       .def(
           "get_state_freshness_report", &AimdkController::get_state_freshness_report,
-          py::arg("timeout_sec"))
+          py::arg("timeout_sec"), py::arg("odometry_timeout_sec") = 0.0)
+      .def("get_safety_status", &AimdkController::get_safety_status)
       .def("get_robot_state", &AimdkController::get_robot_state)
       .def("step", &AimdkController::step, py::arg("positions"))
       .def("arm_position_control", &AimdkController::arm_position_control)
